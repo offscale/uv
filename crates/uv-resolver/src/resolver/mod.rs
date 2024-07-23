@@ -1,7 +1,6 @@
 //! Given a set of requirements, find a set of compatible packages.
 
 use std::borrow::Cow;
-use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter, Write};
 use std::ops::Bound;
@@ -379,13 +378,10 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
 
                     let resolution = state.into_resolution();
 
-                    // Walk over the selected versions, and mark them as preferences.
-                    for (package, versions) in &resolution.nodes {
-                        if let Entry::Vacant(entry) = preferences.entry(package.name.clone()) {
-                            if let Some(version) = versions.iter().next() {
-                                entry.insert(version.clone().into());
-                            }
-                        }
+                    // Walk over the selected versions, and mark them as preferences. Overwrite
+                    // existing preferences to always prefer sibling forks.
+                    for (package, version) in &resolution.nodes {
+                        preferences.insert(package.name.clone(), version.clone());
                     }
 
                     // If another fork had the same resolution, merge into that fork instead.
@@ -409,6 +405,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                         continue 'FORK;
                     }
 
+                    Self::trace_resolution(&resolution);
                     resolutions.push(resolution);
                     continue 'FORK;
                 };
@@ -591,25 +588,22 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 }
             }
         }
-        let mut combined = Resolution::universal();
         if resolutions.len() > 1 {
             info!(
                 "Solved your requirements for {} environments",
                 resolutions.len()
             );
         }
-        for resolution in resolutions {
+        for resolution in &resolutions {
             if let Some(markers) = resolution.markers.fork_markers() {
                 debug!(
                     "Distinct solution for ({markers}) with {} packages",
                     resolution.nodes.len()
                 );
             }
-            combined.union(resolution);
         }
-        Self::trace_resolution(&combined);
         ResolutionGraph::from_state(
-            combined,
+            &resolutions,
             &self.requirements,
             &self.constraints,
             &self.overrides,
@@ -2244,7 +2238,7 @@ impl ForkState {
 
     fn into_resolution(self) -> Resolution {
         let solution = self.pubgrub.partial_solution.extract_solution();
-        let mut dependencies: FxHashSet<ResolutionDependencyEdge> = FxHashSet::default();
+        let mut edges: FxHashSet<ResolutionDependencyEdge> = FxHashSet::default();
         for (package, self_version) in &solution {
             for id in &self.pubgrub.incompatibilities[package] {
                 let pubgrub::solver::Kind::FromDependencyOf(
@@ -2307,7 +2301,7 @@ impl ForkState {
                             to_dev: dependency_dev.clone(),
                             marker: None,
                         };
-                        dependencies.insert(edge);
+                        edges.insert(edge);
                     }
 
                     PubGrubPackageInner::Marker {
@@ -2332,7 +2326,7 @@ impl ForkState {
                             to_dev: None,
                             marker: Some(dependency_marker.clone()),
                         };
-                        dependencies.insert(edge);
+                        edges.insert(edge);
                     }
 
                     PubGrubPackageInner::Extra {
@@ -2358,7 +2352,7 @@ impl ForkState {
                             to_dev: None,
                             marker: dependency_marker.clone(),
                         };
-                        dependencies.insert(edge);
+                        edges.insert(edge);
                     }
 
                     PubGrubPackageInner::Dev {
@@ -2384,7 +2378,7 @@ impl ForkState {
                             to_dev: Some(dependency_dev.clone()),
                             marker: dependency_marker.clone(),
                         };
-                        dependencies.insert(edge);
+                        edges.insert(edge);
                     }
 
                     _ => {}
@@ -2392,7 +2386,7 @@ impl ForkState {
             }
         }
 
-        let packages = solution
+        let nodes = solution
             .into_iter()
             .filter_map(|(package, version)| {
                 if let PubGrubPackageInner::Package {
@@ -2409,7 +2403,7 @@ impl ForkState {
                             dev: dev.clone(),
                             url: self.fork_urls.get(name).cloned(),
                         },
-                        FxHashSet::from_iter([version]),
+                        version,
                     ))
                 } else {
                     None
@@ -2418,21 +2412,18 @@ impl ForkState {
             .collect();
 
         Resolution {
-            nodes: packages,
-            edges: dependencies,
+            nodes,
+            edges,
             pins: self.pins,
             markers: self.markers,
         }
     }
 }
 
-/// The resolution from one or more forks including the virtual packages and the edges between them.
-///
-/// Each package can have multiple versions and each edge between two packages can have multiple
-/// version specifiers to support diverging versions and requirements in different forks.
+/// The resolution from a single fork including the virtual packages and the edges between them.
 #[derive(Debug)]
 pub(crate) struct Resolution {
-    pub(crate) nodes: FxHashMap<ResolutionPackage, FxHashSet<Version>>,
+    pub(crate) nodes: FxHashMap<ResolutionPackage, Version>,
     /// The directed connections between the nodes, where the marker is the node weight. We don't
     /// store the requirement itself, but it can be retrieved from the package metadata.
     pub(crate) edges: FxHashSet<ResolutionDependencyEdge>,
@@ -2472,17 +2463,6 @@ pub(crate) struct ResolutionDependencyEdge {
 }
 
 impl Resolution {
-    fn universal() -> Self {
-        Self {
-            nodes: FxHashMap::default(),
-            edges: FxHashSet::default(),
-            pins: FilePins::default(),
-            markers: ResolverMarkers::Universal,
-        }
-    }
-}
-
-impl Resolution {
     /// Whether we got two identical resolutions in two separate forks.
     ///
     /// Ignores pins since the which distribution we prioritized for each version doesn't matter.
@@ -2494,17 +2474,6 @@ impl Resolution {
         // is still the same graph since the presence or absence of the bar -> foo edge cannot
         // change which packages and versions are installed.
         self.nodes == other.nodes && self.edges == other.edges
-    }
-
-    fn union(&mut self, other: Resolution) {
-        for (other_package, other_versions) in other.nodes {
-            self.nodes
-                .entry(other_package)
-                .or_default()
-                .extend(other_versions);
-        }
-        self.edges.extend(other.edges);
-        self.pins.union(other.pins);
     }
 }
 

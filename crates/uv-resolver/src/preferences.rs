@@ -137,6 +137,10 @@ impl Preferences {
         Self(preferences)
     }
 
+    pub(crate) fn insert(&mut self, package_name: PackageName, pin: impl Into<Pin>) {
+        self.0.insert(package_name, pin.into());
+    }
+
     /// Return the [`Entry`] for a package in the preferences.
     pub fn entry(&mut self, package_name: PackageName) -> Entry<PackageName, Pin> {
         self.0.entry(package_name)
